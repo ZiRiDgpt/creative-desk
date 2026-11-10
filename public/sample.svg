@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" role="img" aria-label="Пример креатива для тестовой задачи">
+  <rect width="800" height="450" fill="#14102e"/>
+  <circle cx="651" cy="226" r="165" fill="#5e42dc"/>
+  <path d="M650 88c13 83 56 126 139 139-83 13-126 56-139 139-13-83-56-126-139-139 83-13 126-56 139-139Z" fill="#e3d9ff"/>
+  <text x="65" y="100" fill="#c7b8ff" font-family="sans-serif" font-size="22" letter-spacing="5">CREATIVE DESK / DEMO</text>
+  <text x="65" y="229" fill="white" font-family="sans-serif" font-size="73" font-weight="700">Первый</text>
+  <text x="65" y="312" fill="white" font-family="sans-serif" font-size="73" font-weight="700">вариант</text>
+</svg>

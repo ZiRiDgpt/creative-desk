@@ -1,0 +1,11 @@
+{
+  "name": "creative-desk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "start": "node --preserve-symlinks --preserve-symlinks-main server/local.mjs",
+    "build": "node --preserve-symlinks --preserve-symlinks-main scripts/build.mjs"
+  }
+}
