@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,7 +12,20 @@ const dataDir = resolve(process.env.DESK_DATA_DIR ?? 'data');
 mkdirSync(dataDir, { recursive: true });
 const sql = new DatabaseSync(resolve(dataDir, 'desk.sqlite'));
 sql.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
-sql.exec(readFileSync(new URL('../drizzle/0000_initial.sql', import.meta.url), 'utf8'));
+const migrations = new URL('../drizzle/', import.meta.url);
+for (const [index, file] of readdirSync(migrations).filter(name => name.endsWith('.sql')).sort().entries()) {
+  sql.exec('BEGIN IMMEDIATE');
+  try {
+    if (sql.prepare('PRAGMA user_version').get().user_version <= index) {
+      sql.exec(readFileSync(new URL(file, migrations), 'utf8'));
+      sql.exec(`PRAGMA user_version = ${index + 1}`);
+    }
+    sql.exec('COMMIT');
+  } catch (error) {
+    sql.exec('ROLLBACK');
+    throw error;
+  }
+}
 
 const db = {
   prepare(query) {
@@ -40,7 +53,7 @@ const db = {
   },
 };
 
-const handle = createApp(readAssets());
+const handle = createApp(readAssets(), { isolated: process.env.DESK_ISOLATED === '1' });
 
 createServer(async (incoming, outgoing) => {
   try {

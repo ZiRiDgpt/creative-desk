@@ -9,6 +9,7 @@ const maxFile = 1024 * 1024;
 export const maxRequestSize = 1_200_000;
 const day = 86_400_000;
 const sessionAge = 7 * 86400;
+const sharedWorkspace = 'legacy';
 const taskTypes = ['Статика', 'Видео', 'UGC', 'Анимация', 'Другое'];
 const priorities = ['low', 'normal', 'high'];
 
@@ -76,9 +77,14 @@ function readCosts(rows) {
   });
 }
 
-function decode(row) {
+function taskKey(workspace, id) {
+  return workspace === sharedWorkspace ? id : `${workspace}:${id}`;
+}
+
+function decode({ workspace_id, ...row }) {
   return {
     ...row,
+    id: row.id.split(':').at(-1),
     brief: JSON.parse(row.brief),
     history: JSON.parse(row.history),
     submissions: JSON.parse(row.submissions),
@@ -113,8 +119,8 @@ function demoTask(id, title, offer, geo, type, quantity, priority, status, age, 
   return [id, status, 'buyer', assignee, created, started, submitted, completed, JSON.stringify(brief), JSON.stringify(history), JSON.stringify(submissions)];
 }
 
-async function seed(db) {
-  if (await db.prepare("SELECT id FROM tasks WHERE id = '101'").first()) return;
+async function seed(db, workspace) {
+  if (await db.prepare('SELECT id FROM tasks WHERE id = ?').bind(taskKey(workspace, '101')).first()) return;
   const samples = [
     ['101', 'Баннеры для летнего запуска', 'FitLab', 'DE', 'Статика', 4, 'high', 'new', 0.1, 1, null],
     ['102', 'UGC-хуки для TikTok', 'GlowUp', 'US', 'UGC', 3, 'normal', 'new', 0.2, 3, null],
@@ -126,9 +132,9 @@ async function seed(db) {
     ['108', 'Карусель для промо оффера', 'FinPilot', 'PL', 'Статика', 4, 'normal', 'done', 4, -1, 'artist', [{ service: 'Midjourney', credits: 32 }, { service: 'ChatGPT', credits: 8 }]],
     ['109', 'Видео для теста гипотезы', 'FitLab', 'DE', 'Видео', 2, 'low', 'done', 5, -2, 'artist2', [{ service: 'Runway', credits: 24 }, { service: 'ChatGPT', credits: 8 }]],
   ];
-  await db.batch(samples.map(sample => db.prepare(
-    'INSERT OR IGNORE INTO tasks (id,status,buyer,assignee,created_at,started_at,submitted_at,completed_at,brief,history,submissions) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-  ).bind(...demoTask(...sample))));
+  await db.batch(samples.map(([id, ...fields]) => db.prepare(
+    'INSERT OR IGNORE INTO tasks (id,status,buyer,assignee,created_at,started_at,submitted_at,completed_at,brief,history,submissions,workspace_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+  ).bind(...demoTask(taskKey(workspace, id), ...fields), workspace)));
 }
 
 function taskStats(tasks) {
@@ -194,23 +200,42 @@ function cookie(request, id, age) {
 async function currentSession(request, db) {
   const id = request.headers.get('cookie')?.match(/(?:^|;\s*)desk_session=([a-f0-9-]{36})(?:;|$)/)?.[1];
   if (!id) return null;
-  const session = await db.prepare('SELECT user_id FROM sessions WHERE id = ? AND expires_at > ?').bind(id, Date.now()).first();
+  const session = await db.prepare('SELECT user_id, workspace_id FROM sessions WHERE id = ? AND expires_at > ?').bind(id, Date.now()).first();
   const user = users.find(item => item.id === session?.user_id);
-  return user ? { id, user } : null;
+  return user ? { id, user, workspace: session.workspace_id } : null;
+}
+
+async function signIn(db, request, session, isolated) {
+  const { userId } = await object(request);
+  const user = users.find(item => item.id === userId);
+  if (!user) throw new HttpError(400, 'Выберите тестовый аккаунт.');
+  const id = session?.id ?? crypto.randomUUID();
+  const workspace = session?.workspace ?? (isolated ? id : sharedWorkspace);
+  const now = Date.now();
+  const expiry = now + sessionAge * 1000;
+  const expiredBoards = 'SELECT workspace_id FROM sessions WHERE expires_at <= ? AND workspace_id != ? AND id != ?';
+  await db.batch([
+    db.prepare(`DELETE FROM attachments WHERE workspace_id IN (${expiredBoards})`).bind(now, sharedWorkspace, id),
+    db.prepare(`DELETE FROM tasks WHERE workspace_id IN (${expiredBoards})`).bind(now, sharedWorkspace, id),
+    db.prepare('DELETE FROM sessions WHERE expires_at <= ? AND id != ?').bind(now, id),
+    db.prepare(`INSERT INTO sessions (id, user_id, expires_at, workspace_id) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, expires_at = excluded.expires_at`).bind(id, user.id, expiry, workspace),
+  ]);
+  return json({ user }, 200, { 'Set-Cookie': cookie(request, id, sessionAge) });
 }
 
 function displayId() {
   return crypto.randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase();
 }
 
-async function saveTask(db, user, request) {
+async function saveTask(db, { user, workspace }, request) {
   if (user.role !== 'buyer') throw new HttpError(403, 'Создавать задачи может байер.');
   const brief = readBrief(await object(request));
   const now = new Date().toISOString();
   const id = displayId();
   const history = [event('create', user.id, now, 'new')];
-  await db.prepare('INSERT INTO tasks (id,status,buyer,created_at,brief,history) VALUES (?,?,?,?,?,?)')
-    .bind(id, 'new', user.id, now, JSON.stringify(brief), JSON.stringify(history)).run();
+  await db.prepare('INSERT INTO tasks (id,status,buyer,created_at,brief,history,workspace_id) VALUES (?,?,?,?,?,?,?)')
+    .bind(taskKey(workspace, id), 'new', user.id, now, JSON.stringify(brief), JSON.stringify(history), workspace).run();
   return json({ id }, 201);
 }
 
@@ -247,8 +272,9 @@ async function readSubmission(request, user, at) {
   return { result, upload };
 }
 
-async function changeTask(db, user, request, id, action) {
-  const row = await db.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first();
+async function changeTask(db, { user, workspace }, request, id, action) {
+  const key = taskKey(workspace, id);
+  const row = await db.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?').bind(key, workspace).first();
   if (!row) throw new HttpError(404, 'Задача не найдена.');
   const task = decode(row);
   const transition = transitions[action];
@@ -277,19 +303,19 @@ async function changeTask(db, user, request, id, action) {
   const update = db.prepare(`UPDATE tasks SET status = ?, assignee = ?, started_at = ?, submitted_at = ?,
     completed_at = ?, history = ?, submissions = ?, version = version + 1 WHERE id = ? AND version = ?`)
     .bind(transition.to, task.assignee, task.started_at, task.submitted_at, task.completed_at,
-      JSON.stringify(task.history), JSON.stringify(task.submissions), id, task.version);
+      JSON.stringify(task.history), JSON.stringify(task.submissions), key, task.version);
   const statements = [update];
   if (attachment) {
-    statements.push(db.prepare(`INSERT INTO attachments (id,content) SELECT ?,? WHERE EXISTS (
+    statements.push(db.prepare(`INSERT INTO attachments (id,content,workspace_id) SELECT ?,?,? WHERE EXISTS (
       SELECT 1 FROM tasks WHERE id = ? AND json_extract(submissions, '$[#-1].file.id') = ?
-    )`).bind(...attachment, id, attachment[0]));
+    )`).bind(...attachment, workspace, key, attachment[0]));
   }
   const [updated] = await db.batch(statements);
   if (updated.meta.changes !== 1) throw new HttpError(409, 'Задача изменилась. Обновите доску.');
   return json({ id });
 }
 
-export function createApp(assets) {
+export function createApp(assets, { isolated = false } = {}) {
   return async function handle(request, db) {
     const { pathname, origin } = new URL(request.url);
     try {
@@ -313,35 +339,27 @@ export function createApp(assets) {
         return json({ user: session?.user ?? null, users });
       }
       if (pathname === '/api/session' && request.method === 'POST') {
-        const { userId } = await object(request);
-        const user = users.find(item => item.id === userId);
-        if (!user) throw new HttpError(400, 'Выберите тестовый аккаунт.');
-        const id = crypto.randomUUID();
-        const operations = [
-          db.prepare('DELETE FROM sessions WHERE expires_at <= ? OR id = ?').bind(Date.now(), session?.id ?? ''),
-          db.prepare('INSERT INTO sessions VALUES (?,?,?)').bind(id, user.id, Date.now() + sessionAge * 1000),
-        ];
-        await db.batch(operations);
-        return json({ user }, 200, { 'Set-Cookie': cookie(request, id, sessionAge) });
+        return await signIn(db, request, session, isolated);
       }
       if (!session) throw new HttpError(401, 'Выберите тестовый аккаунт.');
-      const { user } = session;
+      const { user, workspace } = session;
       if (pathname === '/api/tasks' && request.method === 'GET') {
-        await seed(db);
-        const { results } = await db.prepare('SELECT * FROM tasks ORDER BY created_at DESC, id').all();
+        await seed(db, workspace);
+        const { results } = await db.prepare('SELECT * FROM tasks WHERE workspace_id = ? ORDER BY created_at DESC, id').bind(workspace).all();
         const tasks = results.map(decode);
         return json({ tasks, stats: user.role === 'lead' ? taskStats(tasks) : null });
       }
-      if (pathname === '/api/tasks' && request.method === 'POST') return await saveTask(db, user, request);
+      if (pathname === '/api/tasks' && request.method === 'POST') return await saveTask(db, session, request);
       const transition = pathname.match(/^\/api\/tasks\/([A-Z0-9]+)\/(claim|submit|revise|approve)$/);
       if (transition && request.method === 'POST') {
-        return await changeTask(db, user, request, transition[1], transition[2]);
+        return await changeTask(db, session, request, transition[1], transition[2]);
       }
       const filePath = pathname.match(/^\/api\/tasks\/([A-Z0-9]+)\/files\/([a-f0-9-]{36})$/);
       if (filePath && request.method === 'GET') {
-        const row = await db.prepare('SELECT submissions FROM tasks WHERE id = ?').bind(filePath[1]).first();
+        const row = await db.prepare('SELECT submissions FROM tasks WHERE id = ? AND workspace_id = ?')
+          .bind(taskKey(workspace, filePath[1]), workspace).first();
         const file = row && JSON.parse(row.submissions).find(item => item.file?.id === filePath[2])?.file;
-        const blob = file && await db.prepare('SELECT content FROM attachments WHERE id = ?').bind(file.id).first();
+        const blob = file && await db.prepare('SELECT content FROM attachments WHERE id = ? AND workspace_id = ?').bind(file.id, workspace).first();
         if (!blob) throw new HttpError(404, 'Файл не найден.');
         return new Response(new Uint8Array(blob.content), { headers: {
           'Content-Type': 'application/octet-stream',

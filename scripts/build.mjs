@@ -9,7 +9,7 @@ const app = readFileSync(new URL('../server/app.mjs', import.meta.url), 'utf8');
 writeFileSync(new URL('server/index.js', output), [
   app,
   'const assets = ' + JSON.stringify(readAssets()) + ';',
-  'const handle = createApp(assets);',
+  'const handle = createApp(assets, { isolated: true });',
   'export default { fetch(request, env) { return handle(request, env.DB); } };',
 ].join('\n'));
 const manifest = '.openai/hosting.json';
